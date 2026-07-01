@@ -221,7 +221,7 @@ export function OrderForm({ priceOverride }: OrderFormProps) {
           {
             a: assetIndex,
             b: isBuy,
-            p: limitPx.toFixed(8).replace(/\.?0+$/, ""),
+            p: limitPx.toFixed(2).replace(/\.?0+$/, ""),
             s: roundedSize.toFixed(szDecimals).replace(/\.?0+$/, ""),
             r: reduceOnly,
             t: { limit: { tif: orderType === "market" ? "Ioc" : "Gtc" } },

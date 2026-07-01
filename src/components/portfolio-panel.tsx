@@ -67,7 +67,7 @@ export function PortfolioPanel() {
           {
             a: assetIndex,
             b: !isLong, // opposite side to close
-            p: limitPx.toFixed(8).replace(/\.?0+$/, ""),
+            p: limitPx.toFixed(2).replace(/\.?0+$/, ""),
             // Use token's szDecimals for proper size precision
             s: Number(Math.abs(parseFloat(szi)).toFixed(token?.szDecimals ?? 4)).toString(),
             r: true, // reduceOnly
