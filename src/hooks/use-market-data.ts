@@ -154,13 +154,19 @@ export function useUserData(address: string | null) {
           }
         }
 
-        // Perp account value + USDC spot = total portfolio value
-        const perpAccountValue = parseFloat(state.marginSummary.totalRawUsd);
-        const totalAccountValue = perpAccountValue + spotUSDC;
+        // Use accountValue, not totalRawUsd — that's the actual equity figure
+        const perpAccountValue = parseFloat(state.marginSummary.accountValue);
+        const totalAccountValue = spotUSDC;
+
+        // Real unrealized PnL = sum of each open position's unrealizedPnl
+        const totalUnrealizedPnl = state.assetPositions.reduce(
+          (sum, p) => sum + parseFloat(p.position.unrealizedPnl ?? "0"),
+          0
+        );
 
         setAccountInfo({
           accountValue: String(totalAccountValue),
-          spotTotal: String(spotUSDC), // USDC only
+          spotTotal: String(spotUSDC),
           crossMarginSummary: {
             totalMarginUsed: state.crossMarginSummary.totalMarginUsed,
             totalNtlPos: state.crossMarginSummary.totalNtlPos,
@@ -169,7 +175,7 @@ export function useUserData(address: string | null) {
           marginSummary: {
             totalMarginUsed: state.marginSummary.totalMarginUsed,
             totalNtlPos: state.marginSummary.totalNtlPos,
-            totalUnrealizedPnl: state.marginSummary.totalRawUsd,
+            totalUnrealizedPnl: String(totalUnrealizedPnl),
             totalRawUsd: state.marginSummary.totalRawUsd,
           },
           withdrawable: state.withdrawable,
@@ -182,7 +188,10 @@ export function useUserData(address: string | null) {
             ...p.position,
             side: (parseFloat(p.position.szi) > 0 ? "B" : "A") as "A" | "B",
             liquidationPx: p.position.liquidationPx ?? "0",
-            cumulativeFunding: { closed: "0", allTime: "0" },
+            cumulativeFunding: {
+              closed: p.position.cumFunding?.sinceChange ?? "0",
+              allTime: p.position.cumFunding?.allTime ?? "0",
+            },
             maxTradeSzs: [],
           }));
 
