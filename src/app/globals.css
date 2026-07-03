@@ -72,3 +72,45 @@ body {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Resize handle styles */
+.resize-handle {
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.resize-handle:hover,
+.resize-handle:focus-visible {
+  background: rgba(245, 158, 11, 0.2);
+}
+.resize-handle-horizontal {
+  cursor: col-resize;
+}
+.resize-handle-vertical {
+  cursor: row-resize;
+}
+
+/* Drag overlay (when resizing) */
+.resize-dragging * {
+  cursor: inherit !important;
+}
+.resize-dragging-horizontal * {
+  cursor: col-resize !important;
+}
+.resize-dragging-vertical * {
+  cursor: row-resize !important;
+}
+
+/* Lightweight charts container */
+.lwc-chart-container {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* Touch-friendly scroll */
+.touch-scroll {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}

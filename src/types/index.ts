@@ -133,3 +133,19 @@ export interface WalletState {
 export type OrderSide = "buy" | "sell";
 export type OrderType = "limit" | "market";
 export type LeverageType = "cross" | "isolated";
+
+export interface UserFill {
+  coin: string;
+  side: "B" | "A";
+  sz: string;
+  px: string;
+  time: number;
+  dir: string;
+  closedPnl: string;
+  hash: string;
+  oid: number;
+  crossed: boolean;
+  fee: string;
+  oidSecondary: number;
+  tiled: string;
+}

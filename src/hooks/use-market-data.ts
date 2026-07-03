@@ -112,6 +112,7 @@ export function useUserData(address: string | null) {
     setOpenPositions,
     setOpenOrders,
     setAccountInfo,
+    setTradeHistory,
     tokens,
   } = useAppStore();
   const { hyperliquidWallet } = useWallet();
@@ -129,6 +130,7 @@ export function useUserData(address: string | null) {
       setOpenPositions([]);
       setOpenOrders([]);
       setAccountInfo(null);
+      setTradeHistory([]);
       wsRef.current.userEventsSub?.unsubscribe();
       wsRef.current = {};
       return;
@@ -145,7 +147,7 @@ export function useUserData(address: string | null) {
           clients.info.spotClearinghouseState({ user: address }),
         ]);
 
-        // Calculate total spot balance (USDC only - this is what can be used as margin)
+        // Calculate total spot balance (USDC only)
         let spotUSDC = 0;
         if (spotState?.balances) {
           const usdcBalance = spotState.balances.find(b => b.coin === "USDC" || b.coin === "USDC.e");
@@ -154,15 +156,22 @@ export function useUserData(address: string | null) {
           }
         }
 
-        // Use accountValue, not totalRawUsd — that's the actual equity figure
+        // Perp values from clearinghouse state
         const perpAccountValue = parseFloat(state.marginSummary.accountValue);
-        const totalAccountValue = spotUSDC;
+        const perpWithdrawable = parseFloat(state.withdrawable ?? "0");
+        const perpMarginUsed = parseFloat(state.marginSummary.totalMarginUsed ?? "0");
 
-        // Real unrealized PnL = sum of each open position's unrealizedPnl
+        // Account value = spot balance (primary) + perp equity (unrealized PnL)
+        // This reflects total USD-controlled value
         const totalUnrealizedPnl = state.assetPositions.reduce(
           (sum, p) => sum + parseFloat(p.position.unrealizedPnl ?? "0"),
           0
         );
+        const totalAccountValue = spotUSDC + totalUnrealizedPnl;
+
+        // Withdrawable = spot balance (can always withdraw spot USDC)
+        // Perp withdrawable represents equity that isn't used as margin
+        const totalWithdrawable = spotUSDC;
 
         setAccountInfo({
           accountValue: String(totalAccountValue),
@@ -178,7 +187,7 @@ export function useUserData(address: string | null) {
             totalUnrealizedPnl: String(totalUnrealizedPnl),
             totalRawUsd: state.marginSummary.totalRawUsd,
           },
-          withdrawable: state.withdrawable,
+          withdrawable: String(totalWithdrawable),
         });
 
         // Only include positions with non-zero size
@@ -202,9 +211,21 @@ export function useUserData(address: string | null) {
       }
     }
 
+    async function fetchFills() {
+      if (!address || !clients) return;
+      try {
+        const fills = await clients.info.userFills({ user: address });
+        setTradeHistory(fills as any);
+      } catch (err) {
+        console.error("Trade history fetch failed:", err);
+      }
+    }
+
     // Initial fetch, then poll every 5s as fallback
     fetchAll();
+    fetchFills();
     const interval = setInterval(fetchAll, 5_000);
+    const fillsInterval = setInterval(fetchFills, 15_000);
 
     // WebSocket for instant updates on user events (fills, cancels, liquidations)
     async function connectUserWs() {
@@ -230,7 +251,8 @@ export function useUserData(address: string | null) {
     return () => {
       alive = false;
       clearInterval(interval);
+      clearInterval(fillsInterval);
       wsRef.current.userEventsSub?.unsubscribe();
     };
-  }, [address, clients, tokens, setOpenPositions, setOpenOrders, setAccountInfo]);
+  }, [address, clients, tokens, setOpenPositions, setOpenOrders, setAccountInfo, setTradeHistory]);
 }

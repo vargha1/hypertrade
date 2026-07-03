@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { WalletState, UserOpenPosition, UserOpenOrder, UserAccount, TokenInfo, AssetContext } from "@/types";
+import type { WalletState, UserOpenPosition, UserOpenOrder, UserAccount, TokenInfo, AssetContext, UserFill } from "@/types";
 
 interface AppState {
   // Wallet
@@ -22,6 +22,8 @@ interface AppState {
   setOpenOrders: (orders: UserOpenOrder[]) => void;
   accountInfo: UserAccount | null;
   setAccountInfo: (info: UserAccount | null) => void;
+  tradeHistory: UserFill[];
+  setTradeHistory: (fills: UserFill[]) => void;
 
   // Selected market
   selectedCoin: string;
@@ -45,6 +47,7 @@ export const useAppStore = create<AppState>((set) => ({
       openPositions: [],
       openOrders: [],
       accountInfo: null,
+      tradeHistory: [],
     }),
 
   // Market data
@@ -62,6 +65,8 @@ export const useAppStore = create<AppState>((set) => ({
   setOpenOrders: (openOrders) => set({ openOrders }),
   accountInfo: null,
   setAccountInfo: (accountInfo) => set({ accountInfo }),
+  tradeHistory: [],
+  setTradeHistory: (tradeHistory) => set({ tradeHistory }),
 
   // Selected market
   selectedCoin: "BTC",

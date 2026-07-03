@@ -32,7 +32,8 @@ const BRIDGE_ABI = [
   "function sendDeposit(address usd, uint64 amount) external",
 ];
 
-type Mode = "deposit" | "withdraw";
+type Mode = "deposit" | "withdraw" | "transfer";
+type TransferDir = "toPerp" | "toSpot";
 type Step = "idle" | "approving" | "depositing" | "done";
 
 interface DepositWithdrawModalProps {
@@ -48,6 +49,7 @@ export function DepositWithdrawModal({
   const { showToast, accountInfo } = useAppStore();
 
   const [mode, setMode] = useState<Mode>("deposit");
+  const [transferDir, setTransferDir] = useState<TransferDir>("toPerp");
   const [amount, setAmount] = useState("");
   const [loading, setLoading] = useState(false);
   const [step, setStep] = useState<Step>("idle");
@@ -64,9 +66,15 @@ export function DepositWithdrawModal({
 
   function validate(): string {
     if (!amount || parsedAmount <= 0) return "Enter a valid amount";
-    if (parsedAmount < 5) return "Minimum amount is $5 USDC";
+    if (parsedAmount < 1) return "Minimum amount is $1 USDC";
     if (mode === "withdraw" && parsedAmount > withdrawable)
       return `Max withdrawable: ${formatUSD(withdrawable)}`;
+    if (mode === "transfer") {
+      if (transferDir === "toPerp" && parsedAmount > spotTotal)
+        return `Max spot balance: ${formatUSD(spotTotal)}`;
+      if (transferDir === "toSpot" && parsedAmount > perpTotal)
+        return `Max perp balance: ${formatUSD(perpTotal)}`;
+    }
     return "";
   }
 
@@ -205,7 +213,7 @@ export function DepositWithdrawModal({
 
     try {
       // Spot → Perp (toPerp: true) or Perp → Spot (toPerp: false)
-      const toPerp = spotTotal > perpTotal; // Default direction: move from larger balance
+      const toPerp = transferDir === "toPerp";
 
       setStep("depositing");
       await clients.exchange.usdClassTransfer({
@@ -244,7 +252,8 @@ export function DepositWithdrawModal({
     }
     setFieldError("");
     if (mode === "deposit") handleDeposit();
-    else handleWithdraw();
+    else if (mode === "withdraw") handleWithdraw();
+    else handleTransfer();
   }
 
   function handleClose() {
@@ -263,10 +272,16 @@ export function DepositWithdrawModal({
           { id: "depositing", label: "Send deposit to bridge" },
           { id: "done", label: "Confirmed on-chain" },
         ]
-      : [
+      : mode === "withdraw"
+      ? [
           { id: "approving", label: "Build withdraw request" },
           { id: "depositing", label: "Sign EIP-712 message" },
           { id: "done", label: "Submitted to Hyperliquid L2" },
+        ]
+      : [
+          { id: "approving", label: "Build transfer request" },
+          { id: "depositing", label: "Sign transfer" },
+          { id: "done", label: "Transfer complete" },
         ];
 
   const stepIds = steps.map((s) => s.id);
@@ -276,8 +291,8 @@ export function DepositWithdrawModal({
     <Modal open={open} onClose={handleClose} title="Funds">
       <div className="space-y-5">
         {/* Mode toggle */}
-        <div className="grid grid-cols-2 rounded-xl overflow-hidden border border-[#334155]">
-          {(["deposit", "withdraw"] as Mode[]).map((m) => (
+        <div className="grid grid-cols-3 rounded-xl overflow-hidden border border-[#334155]">
+          {(["deposit", "withdraw", "transfer"] as Mode[]).map((m) => (
             <button
               key={m}
               onClick={() => {
@@ -286,18 +301,48 @@ export function DepositWithdrawModal({
                 setStep("idle");
                 setTxHash("");
               }}
-              className={[
-                "py-2.5 text-sm font-semibold capitalize transition-colors cursor-pointer",
-                mode === m
-                  ? "bg-[#F59E0B] text-[#0F172A]"
-                  : "bg-[#1E293B] text-[#475569] hover:text-[#94A3B8]",
-              ].join(" ")}
-              aria-pressed={mode === m}
-            >
-              {m}
+            className={[
+              "py-2.5 text-sm font-semibold capitalize transition-colors cursor-pointer",
+              mode === m
+                ? "bg-[#F59E0B] text-[#0F172A]"
+                : "text-[#475569] hover:text-[#94A3B8] bg-[#1E293B]",
+            ].join(" ")}
+            aria-pressed={mode === m}
+          >
+            {m === "transfer" ? "Transfer" : m}
             </button>
           ))}
         </div>
+
+        {/* Transfer direction toggle */}
+        {mode === "transfer" && (
+          <div className="flex items-center gap-1 rounded-lg bg-[#1E293B] p-1">
+            <button
+              onClick={() => setTransferDir("toPerp")}
+              className={[
+                "flex-1 py-1.5 text-xs font-medium rounded transition-colors cursor-pointer",
+                transferDir === "toPerp"
+                  ? "bg-[#272F42] text-[#F8FAFC]"
+                  : "text-[#475569] hover:text-[#94A3B8]",
+              ].join(" ")}
+              aria-pressed={transferDir === "toPerp"}
+            >
+              Spot → Perp
+            </button>
+            <button
+              onClick={() => setTransferDir("toSpot")}
+              className={[
+                "flex-1 py-1.5 text-xs font-medium rounded transition-colors cursor-pointer",
+                transferDir === "toSpot"
+                  ? "bg-[#272F42] text-[#F8FAFC]"
+                  : "text-[#475569] hover:text-[#94A3B8]",
+              ].join(" ")}
+              aria-pressed={transferDir === "toSpot"}
+            >
+              Perp → Spot
+            </button>
+          </div>
+        )}
 
         {/* Balances */}
         <div className="grid grid-cols-2 gap-3 rounded-xl bg-[#0F172A] border border-[#334155] p-3 text-[10px]">
@@ -337,6 +382,24 @@ export function DepositWithdrawModal({
               className="text-[#F59E0B] font-medium hover:underline cursor-pointer"
             >
               {formatUSD(withdrawable)}
+            </button>
+          </div>
+        )}
+
+        {mode === "transfer" && (
+          <div className="flex justify-between text-xs">
+            <span className="text-[#475569]">
+              Available {transferDir === "toPerp" ? "Spot" : "Perp"}
+            </span>
+            <button
+              onClick={() =>
+                setAmount(
+                  (transferDir === "toPerp" ? spotTotal : perpTotal).toFixed(2)
+                )
+              }
+              className="text-[#F59E0B] font-medium hover:underline cursor-pointer"
+            >
+              {formatUSD(transferDir === "toPerp" ? spotTotal : perpTotal)}
             </button>
           </div>
         )}

@@ -6,7 +6,10 @@ import { useWallet } from "@/hooks/use-wallet";
 import { formatUSD, formatPrice, pnlClass } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Modal } from "@/components/ui/modal";
+import { Input } from "@/components/ui/input";
 import { createHyperliquidClients } from "@/lib/hyperliquid-client";
+import type { UserOpenOrder, UserOpenPosition } from "@/types";
 
 type Tab = "positions" | "orders" | "history";
 
@@ -20,14 +23,31 @@ export function PortfolioPanel() {
     showToast,
     setOpenPositions,
     setOpenOrders,
+    tradeHistory,
   } = useAppStore();
   const { wallet, hyperliquidWallet } = useWallet();
   const [tab, setTab] = useState<Tab>("positions");
   const [closing, setClosing] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState<number | null>(null);
 
+  // Edit order state
+  const [editingOrder, setEditingOrder] = useState<UserOpenOrder | null>(null);
+  const [editPrice, setEditPrice] = useState("");
+  const [editSize, setEditSize] = useState("");
+  const [editTpPrice, setEditTpPrice] = useState("");
+  const [editSlPrice, setEditSlPrice] = useState("");
+  const [editLoading, setEditLoading] = useState(false);
+
+  // Edit position state
+  const [editingPosition, setEditingPosition] = useState<UserOpenPosition | null>(null);
+  const [posTpPrice, setPosTpPrice] = useState("");
+  const [posSlPrice, setPosSlPrice] = useState("");
+  const [posLoading, setPosLoading] = useState(false);
+
   // Create SDK clients
-  const clients = hyperliquidWallet ? createHyperliquidClients(hyperliquidWallet) : null;
+  const clients = hyperliquidWallet
+    ? createHyperliquidClients(hyperliquidWallet)
+    : null;
 
   const totalPnl = openPositions.reduce(
     (sum, p) => sum + parseFloat(p.unrealizedPnl),
@@ -37,6 +57,231 @@ export function PortfolioPanel() {
   const totalMargin = parseFloat(
     accountInfo?.crossMarginSummary?.totalMarginUsed ?? "0"
   );
+
+  // ─── Open edit modal ────────────────────────────────────────────────────
+  function openEditModal(order: UserOpenOrder) {
+    setEditingOrder(order);
+    setEditPrice(formatPrice(parseFloat(order.limitPx)));
+    setEditSize(order.sz);
+    setEditTpPrice("");
+    setEditSlPrice("");
+  }
+
+  // ─── Submit edit (cancel old + place new) ────────────────────────────────
+  async function handleSubmitEdit() {
+    if (!editingOrder || !clients || !wallet.address) return;
+
+    const assetIndex = tokens.findIndex((t) => t.name === editingOrder.coin);
+    const token = tokens.find((t) => t.name === editingOrder.coin);
+    if (assetIndex === -1) {
+      showToast(`Unknown asset: ${editingOrder.coin}`, "error");
+      return;
+    }
+
+    const price = parseFloat(editPrice);
+    const size = parseFloat(editSize);
+    if (price <= 0 || size <= 0) {
+      showToast("Enter valid price and size", "error");
+      return;
+    }
+
+    setEditLoading(true);
+    try {
+      // 1. Cancel old order
+      await clients.exchangeAgent.cancel({
+        cancels: [{ a: assetIndex, o: editingOrder.oid }],
+      });
+
+      // 2. Place new order with updated params
+      const isBuy = editingOrder.side === "B";
+      const szDecimals = token?.szDecimals ?? 4;
+      const roundedSize = Number(size.toFixed(szDecimals));
+
+      await clients.exchangeAgent.order({
+        orders: [
+          {
+            a: assetIndex,
+            b: isBuy,
+            p: price.toFixed(2).replace(/\.?0+$/, ""),
+            s: roundedSize.toFixed(szDecimals).replace(/\.?0+$/, ""),
+            r: editingOrder.reduceOnly,
+            t: { limit: { tif: "Gtc" } },
+          },
+        ],
+        grouping: "na",
+      });
+
+      // 3. Submit TP/SL trigger orders if specified
+      if (editTpPrice && parseFloat(editTpPrice) > 0) {
+        const tpTriggerPx = parseFloat(editTpPrice)
+          .toFixed(8)
+          .replace(/\.?0+$/, "");
+        await clients.exchangeAgent.order({
+          orders: [
+            {
+              a: assetIndex,
+              b: !isBuy,
+              p: tpTriggerPx,
+              s: roundedSize.toFixed(szDecimals).replace(/\.?0+$/, ""),
+              r: true,
+              t: {
+                trigger: {
+                  triggerPx: tpTriggerPx,
+                  isMarket: true,
+                  tpsl: "tp",
+                },
+              },
+            },
+          ],
+          grouping: "na",
+        });
+      }
+
+      if (editSlPrice && parseFloat(editSlPrice) > 0) {
+        const slTriggerPx = parseFloat(editSlPrice)
+          .toFixed(8)
+          .replace(/\.?0+$/, "");
+        await clients.exchangeAgent.order({
+          orders: [
+            {
+              a: assetIndex,
+              b: !isBuy,
+              p: slTriggerPx,
+              s: roundedSize.toFixed(szDecimals).replace(/\.?0+$/, ""),
+              r: true,
+              t: {
+                trigger: {
+                  triggerPx: slTriggerPx,
+                  isMarket: true,
+                  tpsl: "sl",
+                },
+              },
+            },
+          ],
+          grouping: "na",
+        });
+      }
+
+      showToast(
+        `Order updated: ${isBuy ? "Buy" : "Sell"} ${roundedSize} ${editingOrder.coin} @ $${formatPrice(price)}`,
+        "success"
+      );
+
+      // Update UI
+      setOpenOrders(
+        openOrders.map((o) =>
+          o.oid === editingOrder.oid
+            ? { ...o, limitPx: String(price), sz: String(roundedSize) }
+            : o
+        )
+      );
+      setEditingOrder(null);
+    } catch (err: unknown) {
+      const msg =
+        err instanceof Error
+          ? err.message.includes("user rejected") ||
+            err.message.includes("User denied")
+            ? "Transaction rejected"
+            : err.message.slice(0, 160)
+          : "Failed to edit order";
+      showToast(msg, "error");
+    } finally {
+      setEditLoading(false);
+    }
+  }
+
+  // ─── Edit position: add/update TP/SL ───────────────────────────────────
+  function openEditPositionModal(position: UserOpenPosition) {
+    setEditingPosition(position);
+    setPosTpPrice("");
+    setPosSlPrice("");
+  }
+
+  async function handleSubmitEditPosition() {
+    if (!editingPosition || !clients || !wallet.address) return;
+
+    const assetIndex = tokens.findIndex((t) => t.name === editingPosition.coin);
+    const token = tokens.find((t) => t.name === editingPosition.coin);
+    if (assetIndex === -1) {
+      showToast(`Unknown asset: ${editingPosition.coin}`, "error");
+      return;
+    }
+
+    const size = Math.abs(parseFloat(editingPosition.szi));
+    const isLong = parseFloat(editingPosition.szi) > 0;
+
+    setPosLoading(true);
+    try {
+      // Submit TP trigger order if specified
+      if (posTpPrice && parseFloat(posTpPrice) > 0) {
+        const tpTriggerPx = parseFloat(posTpPrice)
+          .toFixed(8)
+          .replace(/\.?0+$/, "");
+        await clients.exchangeAgent.order({
+          orders: [
+            {
+              a: assetIndex,
+              b: !isLong,
+              p: tpTriggerPx,
+              s: Number(size.toFixed(token?.szDecimals ?? 4)).toString(),
+              r: true,
+              t: {
+                trigger: {
+                  triggerPx: tpTriggerPx,
+                  isMarket: true,
+                  tpsl: "tp",
+                },
+              },
+            },
+          ],
+          grouping: "na",
+        });
+      }
+
+      // Submit SL trigger order if specified
+      if (posSlPrice && parseFloat(posSlPrice) > 0) {
+        const slTriggerPx = parseFloat(posSlPrice)
+          .toFixed(8)
+          .replace(/\.?0+$/, "");
+        await clients.exchangeAgent.order({
+          orders: [
+            {
+              a: assetIndex,
+              b: !isLong,
+              p: slTriggerPx,
+              s: Number(size.toFixed(token?.szDecimals ?? 4)).toString(),
+              r: true,
+              t: {
+                trigger: {
+                  triggerPx: slTriggerPx,
+                  isMarket: true,
+                  tpsl: "sl",
+                },
+              },
+            },
+          ],
+          grouping: "na",
+        });
+      }
+
+      showToast(
+        `TP/SL updated for ${editingPosition.coin}-PERP`,
+        "success"
+      );
+      setEditingPosition(null);
+    } catch (err: unknown) {
+      const msg =
+        err instanceof Error
+          ? err.message.includes("user rejected") ||
+            err.message.includes("User denied")
+            ? "Transaction rejected"
+            : err.message.slice(0, 160)
+          : "Failed to set TP/SL";
+      showToast(msg, "error");
+    } finally {
+      setPosLoading(false);
+    }
+  }
 
   async function handleClosePosition(coin: string, szi: string) {
     if (!wallet.address || !clients) return;
@@ -56,30 +301,26 @@ export function PortfolioPanel() {
 
     setClosing(coin);
     try {
-      // Use the SDK's order method with reduceOnly to close position
       const isLong = parseFloat(szi) > 0;
-      const limitPx = isLong
-        ? markPx * 0.97 // Sell slightly below mark for long
-        : markPx * 1.03; // Buy slightly above mark for short
+      const limitPx = isLong ? markPx * 0.97 : markPx * 1.03;
 
       await clients.exchangeAgent.order({
         orders: [
           {
             a: assetIndex,
-            b: !isLong, // opposite side to close
+            b: !isLong,
             p: limitPx.toFixed(2).replace(/\.?0+$/, ""),
-            // Use token's szDecimals for proper size precision
-            s: Number(Math.abs(parseFloat(szi)).toFixed(token?.szDecimals ?? 4)).toString(),
-            r: true, // reduceOnly
-            t: { limit: { tif: "Ioc" } }, // IOC acts as market order
+            s: Number(
+              Math.abs(parseFloat(szi)).toFixed(token?.szDecimals ?? 4)
+            ).toString(),
+            r: true,
+            t: { limit: { tif: "Ioc" } },
           },
         ],
         grouping: "na",
       });
 
       showToast(`Close order for ${coin}-PERP submitted`, "success");
-
-      // Optimistically remove position from UI
       setOpenPositions(openPositions.filter((p) => p.coin !== coin));
     } catch (err: unknown) {
       const msg =
@@ -109,10 +350,7 @@ export function PortfolioPanel() {
       await clients.exchangeAgent.cancel({
         cancels: [{ a: assetIndex, o: oid }],
       });
-
       showToast("Order cancelled", "success");
-
-      // Optimistically remove from UI
       setOpenOrders(openOrders.filter((o) => o.oid !== oid));
     } catch (err: unknown) {
       const msg =
@@ -294,66 +532,73 @@ export function PortfolioPanel() {
                       const roe = parseFloat(pos.returnOnEquity) * 100;
                       const isLong = pos.side === "B";
                       return (
-                        <tr
-                          key={pos.coin}
-                          className="border-b border-[#1E293B] hover:bg-[#1E293B] transition-colors"
-                        >
-                          <td className="px-4 py-3 font-semibold text-[#F8FAFC]">
-                            {pos.coin}-PERP
-                          </td>
-                          <td className="px-4 py-3">
-                            <Badge variant={isLong ? "success" : "danger"}>
-                              {isLong ? "Long" : "Short"}
-                            </Badge>
-                          </td>
-                          <td className="px-4 py-3 tabular-nums text-[#F8FAFC]">
-                            {Math.abs(parseFloat(pos.szi)).toFixed(4)}{" "}
-                            <span className="text-[#475569]">{pos.coin}</span>
-                          </td>
-                          <td className="px-4 py-3 tabular-nums text-[#94A3B8]">
-                            ${formatPrice(parseFloat(pos.entryPx))}
-                          </td>
-                          <td className="px-4 py-3 tabular-nums text-[#F8FAFC]">
-                            {markPx > 0
-                              ? `$${formatPrice(markPx)}`
-                              : "—"}
-                          </td>
-                          <td className="px-4 py-3 tabular-nums text-[#EF4444]">
-                            {parseFloat(pos.liquidationPx) > 0
-                              ? `$${formatPrice(
-                                  parseFloat(pos.liquidationPx)
-                                )}`
-                              : "—"}
-                          </td>
-                          <td className="px-4 py-3 tabular-nums text-[#94A3B8]">
-                            {formatUSD(parseFloat(pos.marginUsed))}
-                          </td>
-                          <td
-                            className={`px-4 py-3 tabular-nums font-semibold ${pnlClass(pnlNum)}`}
+<tr
+                      key={pos.coin}
+                      className="border-b border-[#1E293B] hover:bg-[#1E293B] transition-colors"
+                    >
+                      <td className="px-4 py-3 font-semibold text-[#F8FAFC]">
+                        {pos.coin}-PERP
+                      </td>
+                      <td className="px-4 py-3">
+                        <Badge variant={isLong ? "success" : "danger"}>
+                          {isLong ? "Long" : "Short"}
+                        </Badge>
+                      </td>
+                      <td className="px-4 py-3 tabular-nums text-[#F8FAFC]">
+                        {Math.abs(parseFloat(pos.szi)).toFixed(4)}{" "}
+                        <span className="text-[#475569]">{pos.coin}</span>
+                      </td>
+                      <td className="px-4 py-3 tabular-nums text-[#94A3B8]">
+                        ${formatPrice(parseFloat(pos.entryPx))}
+                      </td>
+                      <td className="px-4 py-3 tabular-nums text-[#F8FAFC]">
+                        {markPx > 0 ? `$${formatPrice(markPx)}` : "—"}
+                      </td>
+                      <td className="px-4 py-3 tabular-nums text-[#EF4444]">
+                        {parseFloat(pos.liquidationPx) > 0
+                          ? `$${formatPrice(parseFloat(pos.liquidationPx))}`
+                          : "—"}
+                      </td>
+                      <td className="px-4 py-3 tabular-nums text-[#94A3B8]">
+                        {formatUSD(parseFloat(pos.marginUsed))}
+                      </td>
+                      <td
+                        className={`px-4 py-3 tabular-nums font-semibold ${pnlClass(pnlNum)}`}
+                      >
+                        {pnlNum >= 0 ? "+" : ""}
+                        {formatUSD(pnlNum)}
+                      </td>
+                      <td
+                        className={`px-4 py-3 tabular-nums text-xs ${pnlClass(roe)}`}
+                      >
+                        {roe >= 0 ? "+" : ""}
+                        {roe.toFixed(2)}%
+                      </td>
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-1">
+                          <Button
+                            variant="ghost"
+                            size="xs"
+                            onClick={() => openEditPositionModal(pos)}
+                            className="text-[#F59E0B] hover:text-[#F59E0B] hover:bg-[#F59E0B]/10"
+                            aria-label={`Edit TP/SL for ${pos.coin} position`}
                           >
-                            {pnlNum >= 0 ? "+" : ""}
-                            {formatUSD(pnlNum)}
-                          </td>
-                          <td
-                            className={`px-4 py-3 tabular-nums text-xs ${pnlClass(roe)}`}
+                            Edit
+                          </Button>
+                          <Button
+                            variant="danger"
+                            size="xs"
+                            loading={closing === pos.coin}
+                            onClick={() =>
+                              handleClosePosition(pos.coin, pos.szi)
+                            }
+                            aria-label={`Close ${pos.coin} position`}
                           >
-                            {roe >= 0 ? "+" : ""}
-                            {roe.toFixed(2)}%
-                          </td>
-                          <td className="px-4 py-3">
-                            <Button
-                              variant="danger"
-                              size="xs"
-                              loading={closing === pos.coin}
-                              onClick={() =>
-                                handleClosePosition(pos.coin, pos.szi)
-                              }
-                              aria-label={`Close ${pos.coin} position`}
-                            >
-                              Close
-                            </Button>
-                          </td>
-                        </tr>
+                            Close
+                          </Button>
+                        </div>
+                      </td>
+                    </tr>
                       );
                     })}
                   </tbody>
@@ -371,7 +616,7 @@ export function PortfolioPanel() {
             ) : (
               <div className="overflow-x-auto">
                 <table
-                  className="w-full text-xs min-w-[600px]"
+                  className="w-full text-xs min-w-[650px]"
                   aria-label="Open orders"
                 >
                   <thead>
@@ -445,16 +690,29 @@ export function PortfolioPanel() {
                             })}
                           </td>
                           <td className="px-4 py-3">
-                            <Button
-                              variant="ghost"
-                              size="xs"
-                              loading={cancelling === order.oid}
-                              onClick={() => handleCancelOrder(order.oid, order.coin)}
-                              className="text-[#EF4444] hover:text-[#EF4444] hover:bg-[#EF4444]/10"
-                              aria-label={`Cancel order ${order.oid}`}
-                            >
-                              Cancel
-                            </Button>
+                            <div className="flex items-center gap-1">
+                              <Button
+                                variant="ghost"
+                                size="xs"
+                                onClick={() => openEditModal(order)}
+                                className="text-[#F59E0B] hover:text-[#F59E0B] hover:bg-[#F59E0B]/10"
+                                aria-label={`Edit order ${order.oid}`}
+                              >
+                                Edit
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="xs"
+                                loading={cancelling === order.oid}
+                                onClick={() =>
+                                  handleCancelOrder(order.oid, order.coin)
+                                }
+                                className="text-[#EF4444] hover:text-[#EF4444] hover:bg-[#EF4444]/10"
+                                aria-label={`Cancel order ${order.oid}`}
+                              >
+                                Cancel
+                              </Button>
+                            </div>
                           </td>
                         </tr>
                       );
@@ -468,26 +726,303 @@ export function PortfolioPanel() {
 
         {/* ── History ── */}
         {tab === "history" && (
-          <div className="flex flex-col items-center justify-center h-full gap-3 p-8 text-center">
-            <svg
-              className="w-10 h-10 text-[#334155]"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth={1.5}
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
-              />
-            </svg>
-            <p className="text-sm text-[#475569]">
-              Trade history coming soon
-            </p>
+          <div className="flex-1 overflow-auto">
+            {tradeHistory.length === 0 ? (
+              <div className="flex flex-col items-center justify-center h-full gap-3 p-8 text-center">
+                <svg
+                  className="w-10 h-10 text-[#334155]"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth={1.5}
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
+                  />
+                </svg>
+                <p className="text-sm text-[#475569]">No trade history yet</p>
+              </div>
+            ) : (
+              <table className="w-full text-xs">
+                <thead className="sticky top-0 bg-[#0F172A]">
+                  <tr className="text-[#475569] text-left">
+                    <th className="px-3 py-2 font-medium">Time</th>
+                    <th className="px-3 py-2 font-medium">Coin</th>
+                    <th className="px-3 py-2 font-medium">Side</th>
+                    <th className="px-3 py-2 font-medium text-right">Size</th>
+                    <th className="px-3 py-2 font-medium text-right">Price</th>
+                    <th className="px-3 py-2 font-medium text-right">PnL</th>
+                    <th className="px-3 py-2 font-medium text-right">Fee</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#1E293B]">
+                  {tradeHistory.map((fill, i) => {
+                    const isBuy = fill.side === "B";
+                    const pnl = parseFloat(fill.closedPnl);
+                    const fee = parseFloat(fill.fee);
+                    const px = parseFloat(fill.px);
+                    const sz = parseFloat(fill.sz);
+                    const ts = new Date(fill.time);
+                    return (
+                      <tr
+                        key={`${fill.hash}-${i}`}
+                        className="hover:bg-[#1E293B] transition-colors"
+                      >
+                        <td className="px-3 py-1.5 text-[#94A3B8] whitespace-nowrap">
+                          {ts.toLocaleDateString()} {ts.toLocaleTimeString()}
+                        </td>
+                        <td className="px-3 py-1.5 text-[#F8FAFC] font-medium">
+                          {fill.coin}
+                        </td>
+                        <td className="px-3 py-1.5">
+                          <span
+                            className={
+                              isBuy ? "text-[#22C55E]" : "text-[#EF4444]"
+                            }
+                          >
+                            {isBuy ? "Buy" : "Sell"}
+                          </span>
+                        </td>
+                        <td className="px-3 py-1.5 text-right text-[#94A3B8] tabular-nums">
+                          {sz.toFixed(4)}
+                        </td>
+                        <td className="px-3 py-1.5 text-right text-[#94A3B8] tabular-nums">
+                          ${formatPrice(px)}
+                        </td>
+                        <td
+                          className={`px-3 py-1.5 text-right tabular-nums font-medium ${
+                            pnl > 0
+                              ? "text-[#22C55E]"
+                              : pnl < 0
+                              ? "text-[#EF4444]"
+                              : "text-[#475569]"
+                          }`}
+                        >
+                          {pnl !== 0 ? formatUSD(pnl) : "—"}
+                        </td>
+                        <td className="px-3 py-1.5 text-right text-[#EF4444] tabular-nums">
+                          {fee !== 0 ? `-${formatUSD(fee)}` : "—"}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
           </div>
         )}
       </div>
+
+      {/* ─── Edit Order Modal ─── */}
+      {editingOrder && (
+        <Modal
+          open={!!editingOrder}
+          onClose={() => setEditingOrder(null)}
+          title={`Edit Order — ${editingOrder.coin}-PERP`}
+        >
+          <div className="space-y-4">
+            {/* Order info */}
+            <div className="flex items-center gap-3 rounded-lg bg-[#0F172A] border border-[#334155] p-3 text-xs">
+              <Badge
+                variant={editingOrder.side === "B" ? "success" : "danger"}
+              >
+                {editingOrder.side === "B" ? "Buy" : "Sell"}
+              </Badge>
+              <span className="text-[#94A3B8]">
+                {editingOrder.orderType} ·{" "}
+                {editingOrder.reduceOnly ? "Reduce Only" : "Open"}
+              </span>
+            </div>
+
+            {/* Price */}
+            <Input
+              label="Price"
+              type="number"
+              value={editPrice}
+              onChange={(e) => setEditPrice(e.target.value)}
+              suffix="USD"
+              step="0.01"
+            />
+
+            {/* Size */}
+            <Input
+              label="Size"
+              type="number"
+              value={editSize}
+              onChange={(e) => setEditSize(e.target.value)}
+              suffix={editingOrder.coin}
+              step="any"
+            />
+
+            {/* TP/SL */}
+            <div className="grid grid-cols-2 gap-2">
+              <Input
+                label="Take Profit"
+                type="number"
+                value={editTpPrice}
+                onChange={(e) => setEditTpPrice(e.target.value)}
+                placeholder="Optional"
+                suffix="USD"
+                step="0.01"
+              />
+              <Input
+                label="Stop Loss"
+                type="number"
+                value={editSlPrice}
+                onChange={(e) => setEditSlPrice(e.target.value)}
+                placeholder="Optional"
+                suffix="USD"
+                step="0.01"
+              />
+            </div>
+
+            {/* Preview */}
+            {parseFloat(editPrice) > 0 && parseFloat(editSize) > 0 && (
+              <div className="rounded-lg bg-[#0F172A] border border-[#334155] divide-y divide-[#334155] text-xs">
+                {[
+                  [
+                    "Notional",
+                    formatUSD(
+                      parseFloat(editPrice) * parseFloat(editSize)
+                    ),
+                  ],
+                  [
+                    "New Price",
+                    `$${formatPrice(parseFloat(editPrice))}`,
+                  ],
+                  [
+                    "Current Price",
+                    `$${formatPrice(
+                      parseFloat(allMids[editingOrder.coin] ?? "0")
+                    )}`,
+                  ],
+                ].map(([label, value]) => (
+                  <div
+                    key={label}
+                    className="flex justify-between px-3 py-2"
+                  >
+                    <span className="text-[#475569]">{label}</span>
+                    <span className="text-[#94A3B8] tabular-nums">
+                      {value}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <p className="text-[10px] text-[#475569]">
+              This cancels the existing order and places a new one with the
+              updated parameters.
+            </p>
+
+            {/* Actions */}
+            <div className="flex gap-2">
+              <Button
+                variant="ghost"
+                size="lg"
+                fullWidth
+                onClick={() => setEditingOrder(null)}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="primary"
+                size="lg"
+                fullWidth
+                loading={editLoading}
+                onClick={handleSubmitEdit}
+              >
+                Update Order
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+            {/* ─── Edit Position Modal (TP/SL) ─── */}
+      {editingPosition && (
+        <Modal
+          open={!!editingPosition}
+          onClose={() => setEditingPosition(null)}
+          title={`Edit Position — ${editingPosition.coin}-PERP`}
+        >
+          <div className="space-y-4">
+            {/* Position info */}
+            <div className="flex items-center gap-3 rounded-lg bg-[#0F172A] border border-[#334155] p-3 text-xs">
+              <Badge
+                variant={parseFloat(editingPosition.szi) > 0 ? "success" : "danger"}
+              >
+                {parseFloat(editingPosition.szi) > 0 ? "Long" : "Short"}
+              </Badge>
+              <span className="text-[#94A3B8]">
+                {Math.abs(parseFloat(editingPosition.szi)).toFixed(4)} {editingPosition.coin} · Entry ${formatPrice(
+                  parseFloat(editingPosition.entryPx)
+                )}
+              </span>
+            </div>
+            {/* Current mark price */}
+            {(() => {
+              const markPx = parseFloat(
+                allMids[editingPosition.coin] ?? "0"
+              );
+              return (
+                <div className="text-xs text-[#475569]">
+                  Mark: ${formatPrice(markPx)} · Liq: ${formatPrice(
+                    parseFloat(editingPosition.liquidationPx)
+                  )}
+                </div>
+              );
+            })()}
+            {/* TP/SL */}
+            <div className="grid grid-cols-2 gap-2">
+              <Input
+                label="Take Profit"
+                type="number"
+                value={posTpPrice}
+                onChange={(e) => setPosTpPrice(e.target.value)}
+                placeholder="Optional"
+                suffix="USD"
+                step="0.01"
+              />
+              <Input
+                label="Stop Loss"
+                type="number"
+                value={posSlPrice}
+                onChange={(e) => setPosSlPrice(e.target.value)}
+                placeholder="Optional"
+                suffix="USD"
+                step="0.01"
+              />
+            </div>
+            <p className="text-[10px] text-[#475569]">
+              TP/SL trigger orders will be placed as reduce-only market orders
+            </p>
+            {/* Actions */}
+            <div className="flex gap-2">
+              <Button
+                variant="ghost"
+                size="lg"
+                fullWidth
+                onClick={() => setEditingPosition(null)}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="primary"
+                size="lg"
+                fullWidth
+                loading={posLoading}
+                onClick={handleSubmitEditPosition}
+              >
+                Set TP/SL
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
     </div>
   );
 }

@@ -1,12 +1,14 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import {
   createChart,
   CandlestickSeries,
+  HistogramSeries,
   type IChartApi,
   type ISeriesApi,
   type CandlestickData,
+  type HistogramData,
   type SeriesType,
   type Time,
   CrosshairMode,
@@ -17,11 +19,12 @@ import { formatPrice } from "@/lib/utils";
 import { Spinner } from "@/components/ui/spinner";
 
 const HL_WS_URL = "wss://api.hyperliquid.xyz/ws";
+const HL_API = "https://api.hyperliquid.xyz/info";
 
 interface CandleSnapshot {
-  t: number; // open time (ms)
-  T: number; // close time (ms)
-  s: string; // symbol
+  t: number;
+  T: number;
+  s: string;
   o: string;
   c: string;
   h: string;
@@ -39,58 +42,90 @@ const INTERVALS = [
   { label: "1d", value: "1d" },
 ];
 
-const HL_API = "https://api.hyperliquid.xyz/info";
+const INTERVAL_MS: Record<string, number> = {
+  "1m": 60_000,
+  "5m": 300_000,
+  "15m": 900_000,
+  "1h": 3_600_000,
+  "4h": 14_400_000,
+  "1d": 86_400_000,
+};
 
-async function fetchCandles(
+function parseCandles(data: CandleSnapshot[]) {
+  const candles: CandlestickData<Time>[] = [];
+  const volumes: HistogramData<Time>[] = [];
+  for (const c of data) {
+    const time = Math.floor(c.t / 1000) as Time;
+    const open = parseFloat(c.o);
+    const close = parseFloat(c.c);
+    const vol = parseFloat(c.v);
+    candles.push({
+      time,
+      open,
+      high: parseFloat(c.h),
+      low: parseFloat(c.l),
+      close,
+    });
+    volumes.push({
+      time,
+      value: vol,
+      color: close >= open ? "rgba(34,197,94,0.3)" : "rgba(239,68,68,0.3)",
+    });
+  }
+  return { candles, volumes };
+}
+
+async function fetchCandleData(
   coin: string,
-  interval: string
-): Promise<CandlestickData<Time>[]> {
-  const intervalMs: Record<string, number> = {
-    "1m": 60_000,
-    "5m": 300_000,
-    "15m": 900_000,
-    "1h": 3_600_000,
-    "4h": 14_400_000,
-    "1d": 86_400_000,
-  };
-  const now = Date.now();
-  const ms = intervalMs[interval] ?? 3_600_000;
-  const startTime = now - ms * 500;
-
+  interval: string,
+  startTime: number,
+  endTime: number
+): Promise<CandleSnapshot[]> {
   const res = await fetch(HL_API, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       type: "candleSnapshot",
-      req: { coin, interval, startTime, endTime: now },
+      req: { coin, interval, startTime, endTime },
     }),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-  const data = (await res.json()) as CandleSnapshot[];
-  return data.map((c) => ({
-    time: Math.floor(c.t / 1000) as Time,
-    open: parseFloat(c.o),
-    high: parseFloat(c.h),
-    low: parseFloat(c.l),
-    close: parseFloat(c.c),
-  }));
+  return res.json();
 }
 
 export function PriceChart() {
-  const { selectedCoin, allMids, assetContexts } = useAppStore();
+  const { selectedCoin, allMids, assetContexts, openPositions, openOrders } =
+    useAppStore();
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<SeriesType> | null>(null);
+  const volumeSeriesRef = useRef<ISeriesApi<SeriesType> | null>(null);
+  const priceLinesRef = useRef<
+    ReturnType<ISeriesApi<SeriesType>["createPriceLine"]>[]
+  >([]);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastCandleTimeRef = useRef<number>(0);
   const pollIntervalRef = useRef<number | null>(null);
+
+  // ── Candle state tracking (for infinite scroll merge) ──
+  const allCandlesRef = useRef<Map<Time, CandlestickData<Time>>>(new Map());
+  const allVolumesRef = useRef<Map<Time, HistogramData<Time>>>(new Map());
+  const isLoadingMoreRef = useRef(false);
+  const loadMoreDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [interval, setInterval] = useState("1h");
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [retryKey, setRetryKey] = useState(0);
+
+  // OHLC crosshair data
+  const [hoverOHLV, setHoverOHLV] = useState<{
+    o: number;
+    h: number;
+    l: number;
+    c: number;
+    v: number;
+  } | null>(null);
 
   const mid = parseFloat(allMids[selectedCoin] ?? "0");
   const ctx = assetContexts[selectedCoin];
@@ -99,7 +134,40 @@ export function PriceChart() {
     prevDay && prevDay !== mid ? ((mid - prevDay) / prevDay) * 100 : 0;
   const changeUp = change >= 0;
 
-  // Create chart once on mount
+  const currentPosition = openPositions.find(
+    (p) => p.coin === selectedCoin && parseFloat(p.szi) !== 0
+  );
+  const entryPx = currentPosition ? parseFloat(currentPosition.entryPx) : 0;
+
+  const pendingOrders = openOrders.filter(
+    (o) => o.coin === selectedCoin && !o.triggerCondition
+  );
+
+  // ─── Helper: merge candles into map and push to series ──────────────────
+  const mergeAndSetCandles = useCallback(
+    (
+      newCandles: CandlestickData<Time>[],
+      newVolumes: HistogramData<Time>[]
+    ) => {
+      for (const c of newCandles) allCandlesRef.current.set(c.time, c);
+      for (const v of newVolumes) allVolumesRef.current.set(v.time, v);
+
+      const sortedCandles = Array.from(allCandlesRef.current.values()).sort(
+        (a, b) => (Number(a.time) - Number(b.time))
+      );
+      const sortedVolumes = Array.from(allVolumesRef.current.values()).sort(
+        (a, b) => (Number(a.time) - Number(b.time))
+      );
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (seriesRef.current as any)?.setData(sortedCandles);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (volumeSeriesRef.current as any)?.setData(sortedVolumes);
+    },
+    []
+  );
+
+  // ─── Create chart once ──────────────────────────────────────────────────
   useEffect(() => {
     if (!containerRef.current) return;
 
@@ -121,19 +189,21 @@ export function PriceChart() {
       },
       rightPriceScale: {
         borderColor: "#334155",
-        scaleMargins: { top: 0.05, bottom: 0.05 },
+        scaleMargins: { top: 0.08, bottom: 0.25 },
       },
       timeScale: {
         borderColor: "#334155",
         timeVisible: true,
         secondsVisible: false,
+        rightOffset: 5,
+        minBarSpacing: 1,
       },
       handleScroll: true,
       handleScale: true,
     });
     chartRef.current = chart;
 
-    seriesRef.current = chart.addSeries(CandlestickSeries, {
+    const candleSeries = chart.addSeries(CandlestickSeries, {
       upColor: "#22C55E",
       downColor: "#EF4444",
       borderUpColor: "#22C55E",
@@ -141,7 +211,43 @@ export function PriceChart() {
       wickUpColor: "#22C55E",
       wickDownColor: "#EF4444",
     });
+    seriesRef.current = candleSeries;
 
+    const volSeries = chart.addSeries(HistogramSeries, {
+      priceFormat: { type: "volume" },
+      priceScaleId: "volume",
+    });
+    volumeSeriesRef.current = volSeries;
+    chart.priceScale("volume").applyOptions({
+      scaleMargins: { top: 0.8, bottom: 0 },
+    });
+
+    // ─── OHLC crosshair handler ──────────────────────────────────────────
+    chart.subscribeCrosshairMove((param) => {
+      if (!param || !param.time || !param.seriesData) {
+        setHoverOHLV(null);
+        return;
+      }
+
+      const candleData = param.seriesData.get(candleSeries) as
+        | CandlestickData<Time>
+        | undefined;
+      const volData = param.seriesData.get(volSeries) as
+        | HistogramData<Time>
+        | undefined;
+
+      if (candleData) {
+        setHoverOHLV({
+          o: candleData.open,
+          h: candleData.high,
+          l: candleData.low,
+          c: candleData.close,
+          v: volData?.value ?? 0,
+        });
+      }
+    });
+
+    // ─── Resize observer ──────────────────────────────────────────────────
     const ro = new ResizeObserver(() => {
       if (containerRef.current) {
         chart.resize(
@@ -157,23 +263,48 @@ export function PriceChart() {
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
+      volumeSeriesRef.current = null;
     };
   }, []);
 
-  // Load initial candles
+  // ─── Load initial candles ────────────────────────────────────────────────
   useEffect(() => {
-    if (!seriesRef.current) return;
+    if (!seriesRef.current || !volumeSeriesRef.current) return;
     setLoading(true);
     setLoadError(null);
+    isLoadingMoreRef.current = false;
 
-    fetchCandles(selectedCoin, interval)
-      .then((candles) => {
+    // Clear old data
+    allCandlesRef.current.clear();
+    allVolumesRef.current.clear();
+
+    const now = Date.now();
+    const ms = INTERVAL_MS[interval] ?? 3_600_000;
+    const startTime = now - ms * 500;
+
+    fetchCandleData(selectedCoin, interval, startTime, now)
+      .then((data) => {
+        if (!seriesRef.current) return;
+        const { candles, volumes } = parseCandles(data);
+
+        // Store all candles in the tracking map
+        for (const c of candles) allCandlesRef.current.set(c.time, c);
+        for (const v of volumes) allVolumesRef.current.set(v.time, v);
+
+        const sortedCandles = Array.from(allCandlesRef.current.values()).sort(
+          (a, b) => (Number(a.time) - Number(b.time))
+        );
+        const sortedVolumes = Array.from(allVolumesRef.current.values()).sort(
+          (a, b) => (Number(a.time) - Number(b.time))
+        );
+
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (seriesRef.current as any).setData(candles);
+        (seriesRef.current as any).setData(sortedCandles);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (volumeSeriesRef.current as any).setData(sortedVolumes);
+
         chartRef.current?.timeScale().fitContent();
-        if (candles.length > 0) {
-          lastCandleTimeRef.current = candles[candles.length - 1].time as number;
-        }
+        chartRef.current?.timeScale().scrollToRealTime();
         setLoading(false);
       })
       .catch((err: Error) => {
@@ -182,7 +313,85 @@ export function PriceChart() {
       });
   }, [selectedCoin, interval, retryKey]);
 
-  // Live WebSocket candle updates
+  // ─── Infinite scroll: load older candles when scrolling left ──────────────
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart || !seriesRef.current) return;
+
+    const handleVisibleRange = () => {
+      if (isLoadingMoreRef.current) return;
+
+      const visibleRange = chart.timeScale().getVisibleLogicalRange();
+      if (!visibleRange) return;
+
+      // Only trigger when user scrolls close to the left edge
+      if (visibleRange.from > 30) return;
+
+      // Debounce: don't fire more than once per second
+      if (loadMoreDebounceRef.current) return;
+
+      const earliestTime = Array.from(allCandlesRef.current.keys()).sort(
+        (a, b) => Number(a) - Number(b)
+      )[0];
+      if (!earliestTime) return;
+
+      isLoadingMoreRef.current = true;
+      loadMoreDebounceRef.current = setTimeout(() => {
+        loadMoreDebounceRef.current = null;
+      }, 1000);
+
+      const ms = INTERVAL_MS[interval] ?? 3_600_000;
+      const earliestMs = Number(earliestTime) * 1000;
+      const olderStart = earliestMs - ms * 250;
+      const olderEnd = earliestMs - 1;
+
+      fetchCandleData(selectedCoin, interval, olderStart, olderEnd)
+        .then((data) => {
+          if (data.length === 0 || !seriesRef.current) {
+            isLoadingMoreRef.current = false;
+            return;
+          }
+
+          const { candles, volumes } = parseCandles(data);
+
+          // Merge into existing data (keyed by time, so duplicates overwrite)
+          for (const c of candles) allCandlesRef.current.set(c.time, c);
+          for (const v of volumes) allVolumesRef.current.set(v.time, v);
+
+          const sortedCandles = Array.from(allCandlesRef.current.values()).sort(
+            (a, b) => (Number(a.time) - Number(b.time))
+          );
+          const sortedVolumes = Array.from(allVolumesRef.current.values()).sort(
+            (a, b) => (Number(a.time) - Number(b.time))
+          );
+
+          // Use setData with full merged array — preserves scroll position
+          // because lightweight-charts keeps the visible range stable
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (seriesRef.current as any).setData(sortedCandles);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (volumeSeriesRef.current as any).setData(sortedVolumes);
+
+          isLoadingMoreRef.current = false;
+        })
+        .catch(() => {
+          isLoadingMoreRef.current = false;
+        });
+    };
+
+    chart.timeScale().subscribeVisibleLogicalRangeChange(handleVisibleRange);
+    return () => {
+      chart
+        .timeScale()
+        .unsubscribeVisibleLogicalRangeChange(handleVisibleRange);
+      if (loadMoreDebounceRef.current) {
+        clearTimeout(loadMoreDebounceRef.current);
+        loadMoreDebounceRef.current = null;
+      }
+    };
+  }, [selectedCoin, interval]);
+
+  // ─── Live WebSocket candle updates ────────────────────────────────────────
   useEffect(() => {
     if (!selectedCoin || !interval) return;
     let alive = true;
@@ -208,24 +417,39 @@ export function PriceChart() {
           };
           if (msg.channel === "candle" && seriesRef.current) {
             const candle = Array.isArray(msg.data) ? msg.data[0] : msg.data;
-            const candleTime = Math.floor(candle.t / 1000);
+            const time = Math.floor(candle.t / 1000) as Time;
+            const open = parseFloat(candle.o);
+            const close = parseFloat(candle.c);
+            const vol = parseFloat(candle.v);
 
-            if (candleTime >= lastCandleTimeRef.current) {
-              const newCandle: CandlestickData<Time> = {
-                time: candleTime as Time,
-                open: parseFloat(candle.o),
-                high: parseFloat(candle.h),
-                low: parseFloat(candle.l),
-                close: parseFloat(candle.c),
-              };
+            const candleData: CandlestickData<Time> = {
+              time,
+              open,
+              high: parseFloat(candle.h),
+              low: parseFloat(candle.l),
+              close,
+            };
+            const volData: HistogramData<Time> = {
+              time,
+              value: vol,
+              color:
+                close >= open
+                  ? "rgba(34,197,94,0.3)"
+                  : "rgba(239,68,68,0.3)",
+            };
 
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              (seriesRef.current as any).update(newCandle);
-              lastCandleTimeRef.current = candleTime;
-            }
+            // Update tracking maps
+            allCandlesRef.current.set(time, candleData);
+            allVolumesRef.current.set(time, volData);
+
+            // Use update() for live candles — no scroll jump
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (seriesRef.current as any).update(candleData);
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (volumeSeriesRef.current as any).update(volData);
           }
         } catch {
-          // ignore parse errors
+          /* ignore parse errors */
         }
       };
 
@@ -238,15 +462,45 @@ export function PriceChart() {
 
     connect();
 
-    // Fallback: poll for new candles every 5s
+    // Fallback poll every 5s
     pollIntervalRef.current = window.setInterval(() => {
-      if (!seriesRef.current) return;
-      fetchCandles(selectedCoin, interval)
-        .then((candles) => {
-          if (candles.length > 0) {
-            const last = candles[candles.length - 1];
+      if (!seriesRef.current || !alive) return;
+      const now = Date.now();
+      const ms = INTERVAL_MS[interval] ?? 3_600_000;
+      fetchCandleData(selectedCoin, interval, now - ms * 2, now)
+        .then((data) => {
+          if (data.length > 0 && seriesRef.current) {
+            const last = data[data.length - 1];
+            const time = Math.floor(last.t / 1000) as Time;
+            const open = parseFloat(last.o);
+            const close = parseFloat(last.c);
+            const vol = parseFloat(last.v);
+
+            const candleData: CandlestickData<Time> = {
+              time,
+              open,
+              high: parseFloat(last.h),
+              low: parseFloat(last.l),
+              close,
+            };
+            const volData: HistogramData<Time> = {
+              time,
+              value: vol,
+              color:
+                close >= open
+                  ? "rgba(34,197,94,0.3)"
+                  : "rgba(239,68,68,0.3)",
+            };
+
+            allCandlesRef.current.set(time, candleData);
+            allVolumesRef.current.set(time, volData);
+
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            (seriesRef.current as any).update(last);
+            (seriesRef.current as any).update(candleData);
+            if (volumeSeriesRef.current) {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              (volumeSeriesRef.current as any).update(volData);
+            }
           }
         })
         .catch(() => {});
@@ -254,11 +508,69 @@ export function PriceChart() {
 
     return () => {
       alive = false;
-      if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
-      if (pollIntervalRef.current) window.clearInterval(pollIntervalRef.current);
+      if (reconnectTimerRef.current)
+        window.clearTimeout(reconnectTimerRef.current);
+      if (pollIntervalRef.current)
+        window.clearInterval(pollIntervalRef.current);
       wsRef.current?.close();
     };
   }, [selectedCoin, interval]);
+
+  // ─── Price lines: position entry + limit orders ──────────────────────────
+  const updatePriceLines = useCallback(() => {
+    if (!seriesRef.current) return;
+    const series = seriesRef.current;
+
+    // Remove old price lines
+    for (const line of priceLinesRef.current) {
+      try {
+        series.removePriceLine(line);
+      } catch {
+        /* ignore */
+      }
+    }
+    priceLinesRef.current = [];
+
+    const newLines: ReturnType<
+      ISeriesApi<SeriesType>["createPriceLine"]
+    >[] = [];
+
+    if (entryPx > 0) {
+      const isLong = parseFloat(currentPosition?.szi ?? "0") > 0;
+      const line = series.createPriceLine({
+        price: entryPx,
+        color: isLong ? "#22C55E" : "#EF4444",
+        lineWidth: 1,
+        lineStyle: 2,
+        axisLabelVisible: true,
+        title: `Entry ${isLong ? "▲" : "▼"}`,
+      });
+      newLines.push(line);
+    }
+
+    for (const order of pendingOrders) {
+      const px = parseFloat(order.limitPx);
+      if (px <= 0) continue;
+      const isBuy = order.side === "B";
+      const line = series.createPriceLine({
+        price: px,
+        color: isBuy ? "#22C55E" : "#EF4444",
+        lineWidth: 1,
+        lineStyle: 1,
+        axisLabelVisible: true,
+        title: `${isBuy ? "Buy" : "Sell"} ${parseFloat(order.sz).toFixed(2)}`,
+      });
+      newLines.push(line);
+    }
+
+    priceLinesRef.current = newLines;
+  }, [entryPx, currentPosition, pendingOrders]);
+
+  useEffect(() => {
+    updatePriceLines();
+  }, [updatePriceLines]);
+
+  const ohlc = hoverOHLV;
 
   return (
     <div className="flex flex-col h-full">
@@ -281,6 +593,39 @@ export function PriceChart() {
               </span>
             </>
           )}
+
+          {/* OHLC overlay */}
+          <div className="flex items-center gap-2 text-[10px] tabular-nums font-mono">
+            {ohlc ? (
+              <>
+                <span className="text-[#475569]">O</span>
+                <span className="text-[#94A3B8]">{formatPrice(ohlc.o)}</span>
+                <span className="text-[#475569]">H</span>
+                <span className="text-[#94A3B8]">{formatPrice(ohlc.h)}</span>
+                <span className="text-[#475569]">L</span>
+                <span className="text-[#94A3B8]">{formatPrice(ohlc.l)}</span>
+                <span className="text-[#475569]">C</span>
+                <span
+                  className={
+                    ohlc.c >= ohlc.o ? "text-[#22C55E]" : "text-[#EF4444]"
+                  }
+                >
+                  {formatPrice(ohlc.c)}
+                </span>
+                <span className="text-[#475569]">Vol</span>
+                <span className="text-[#94A3B8]">
+                  {ohlc.v >= 1_000_000
+                    ? `${(ohlc.v / 1_000_000).toFixed(2)}M`
+                    : ohlc.v >= 1_000
+                    ? `${(ohlc.v / 1_000).toFixed(1)}K`
+                    : ohlc.v.toFixed(0)}
+                </span>
+              </>
+            ) : (
+              <span className="text-[#475569]">Hover chart for OHLC</span>
+            )}
+          </div>
+
           {ctx && (
             <div className="hidden lg:flex items-center gap-4 text-xs text-[#475569]">
               <span>
@@ -291,13 +636,17 @@ export function PriceChart() {
               </span>
               <span>
                 Mark:{" "}
-                <span className="text-[#94A3B8]">${formatPrice(ctx.markPx)}</span>
+                <span className="text-[#94A3B8]">
+                  ${formatPrice(ctx.markPx)}
+                </span>
               </span>
               <span>
                 Funding:{" "}
                 <span
                   className={
-                    ctx.fundingRate >= 0 ? "text-[#22C55E]" : "text-[#EF4444]"
+                    ctx.fundingRate >= 0
+                      ? "text-[#22C55E]"
+                      : "text-[#EF4444]"
                   }
                 >
                   {ctx.fundingRate >= 0 ? "+" : ""}
